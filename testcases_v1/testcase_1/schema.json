@@ -1,0 +1,41 @@
+{
+    "inputs":[{
+        "name":"addresses",
+        "columns": [
+            ["first","String"],
+            ["last","String"],
+            ["address","String"],
+            ["city","String"],
+            ["state","String"],
+            ["zip","String"]
+        ]
+    },{
+        "name":"airtravel",
+        "columns": [
+            ["month","String"],
+            ["1958","Numeric"],
+            ["1959","Numeric"],
+            ["1960","Numeric"]
+        ]
+    },{
+        "name":"cities",
+        "columns": [
+            ["LatD","Numeric"],
+            ["LatM","Numeric"],
+            ["LatS","Numeric"],
+            ["NS","String"],
+            ["LonD","Numeric"],
+            ["LonM","Numeric"],
+            ["LonS","Numeric"],
+            ["EW","String"],
+            ["city","String"],
+            ["state","String"]
+        ]
+    }],
+    "output":[
+        ["month","String"],
+        ["1958","Numeric"],
+        ["1959","Numeric"],
+        ["1960","Numeric"]
+    ]
+}

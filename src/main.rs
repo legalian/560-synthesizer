@@ -1,25 +1,26 @@
 use std::collections::HashSet;
+use std::collections::HashMap;
 use std::collections::VecDeque;
-use chrono::{DateTime, TimeZone, NaiveDateTime, Utc};
+use chrono::{NaiveDateTime};
 
 use std::env;
-use std::error::Error;
-use std::ffi::OsString;
 use std::fs::File;
-use std::process;
 
-use petgraph::visit::{GraphBase, Walker, IntoNeighborsDirected};
-use petgraph::{Graph,Direction,Directed};
+use petgraph::{Graph,Directed};
 use petgraph::graph::{Edges,EdgeReference};
 use petgraph::prelude::{NodeIndex,EdgeIndex};
 use petgraph::visit::EdgeRef;
 
+use serde::{Serialize,Deserialize};
+
 use std::vec::IntoIter;
+use std::io::Read;
+use csv::{Reader,Writer};
 
 use std::rc::{Rc};
 use std::cmp::Ordering;
-
-
+use std::fs;
+use std::str::FromStr;
 
 type Tname = usize;
 type Cname = usize;
@@ -58,24 +59,29 @@ enum Tier1Table {
     Order(Tier2Table,Vec<Key>),
     N(Tier2Table)
 }
+use Tier1Table::{*};
 enum Tier2Table {
     Project(Tier3Table,Vec<Cname>),
     N(Tier3Table)
 }
+use Tier2Table::{*};
 enum Tier3Table {
     Select(Tier4Table,Pred),
     N(Tier4Table)
 }
+use Tier3Table::{*};
 enum Tier4Table {
     Named(Tname),
     Group( Box<Tier3Table>, Vec<Cname>, Vec<Gc>),
     Join( Box<Tier4Table>, Box<Tier4Table>, Pairs),
     LeftJoin( Box<Tier4Table>, Box<Tier3Table>, Pair)
 }
+use Tier4Table::{*};
 
 
 trait Query {
     fn evaluate(&self,tables:&Vec<Table>)->Table;
+    fn totop(self)->Tier1Table;
 }
 
 impl Query for Tier1Table {
@@ -108,6 +114,7 @@ impl Query for Tier1Table {
             Tier1Table::N(sq) => sq.evaluate(tables)
         }
     }
+    fn totop(self)->Tier1Table {self}
 }
 impl Query for Tier2Table {
     fn evaluate(&self,tables:&Vec<Table>)->Table {
@@ -122,6 +129,7 @@ impl Query for Tier2Table {
             Tier2Table::N(sq) => sq.evaluate(tables)
         }
     }
+    fn totop(self)->Tier1Table {Tier1Table::N(self)}
 }
 impl Query for Tier3Table {
     fn evaluate(&self,tables:&Vec<Table>)->Table {
@@ -135,6 +143,7 @@ impl Query for Tier3Table {
             Tier3Table::N(sq) => sq.evaluate(tables)
         }
     }
+    fn totop(self)->Tier1Table {Tier1Table::N(Tier2Table::N(self))}
 }
 impl Query for Tier4Table {
     fn evaluate(&self,tables:&Vec<Table>)->Table {
@@ -216,6 +225,7 @@ impl Query for Tier4Table {
             }
         }
     }
+    fn totop(self)->Tier1Table {Tier1Table::N(Tier2Table::N(Tier3Table::N(self)))}
 }
 
 
@@ -238,16 +248,16 @@ impl Query for Tier4Table {
 
 
 
-#[derive(Clone)]
+#[derive(Debug,Clone)]
 enum Column {
     String(Vec<Option<String>>),
     Numeric(Vec<Option<f64>>),
-    Time(Vec<Option<DateTime<Utc>>>)
+    Time(Vec<Option<NaiveDateTime>>)
 }
 enum ColumnPair<'a> {
     String(&'a Vec<Option<String>>,&'a Vec<Option<String>>),
     Numeric(&'a Vec<Option<f64>>,&'a Vec<Option<f64>>),
-    Time(&'a Vec<Option<DateTime<Utc>>>,&'a Vec<Option<DateTime<Utc>>>)
+    Time(&'a Vec<Option<NaiveDateTime>>,&'a Vec<Option<NaiveDateTime>>)
 }
 fn columns_same_type<'a>(a:&'a Column,b:&'a Column)->Option<ColumnPair<'a>> {
     match (a,b) {
@@ -260,7 +270,7 @@ fn columns_same_type<'a>(a:&'a Column,b:&'a Column)->Option<ColumnPair<'a>> {
 enum ColumnPairMut<'a> {
     String(&'a mut Vec<Option<String>>,&'a Vec<Option<String>>),
     Numeric(&'a mut Vec<Option<f64>>,&'a Vec<Option<f64>>),
-    Time(&'a mut Vec<Option<DateTime<Utc>>>,&'a Vec<Option<DateTime<Utc>>>)
+    Time(&'a mut Vec<Option<NaiveDateTime>>,&'a Vec<Option<NaiveDateTime>>)
 }
 fn columns_same_type_mut<'a>(a:&'a mut Column,b:&'a Column)->Option<ColumnPairMut<'a>> {
     match (a,b) {
@@ -269,6 +279,17 @@ fn columns_same_type_mut<'a>(a:&'a mut Column,b:&'a Column)->Option<ColumnPairMu
         (Column::Time(a),Column::Time(b))=>Some(ColumnPairMut::Time(a,b)),
         _=>None
     }
+}
+fn compare_table_values_full<'a>(a:&'a Table,b:&'a Table)->bool {
+    if a.columns.len() != b.columns.len() || a.rows != b.rows {return false;}
+    a.columns.iter().zip(b.columns.iter()).all(|(cola,colb)|{
+        match columns_same_type(&cola,&colb) {
+            None=>panic!("incorrectly typed comparison"),
+            Some(ColumnPair::String(ac,bc)) => ac.iter().zip(bc.iter()).all(|(a,b)|a==b),
+            Some(ColumnPair::Numeric(ac,bc)) => ac.iter().zip(bc.iter()).all(|(a,b)|a==b),
+            Some(ColumnPair::Time(ac,bc)) => ac.iter().zip(bc.iter()).all(|(a,b)|a==b)
+        }
+    })
 }
 fn compare_table_values<'a>(a:&'a Table,ac:usize,ai:usize,b:&'a Table,bc:usize,bi:usize)->bool {
     match columns_same_type(&a.columns[ac],&b.columns[bc]) {
@@ -294,7 +315,7 @@ fn move_table_values<'a>(a:&'a mut Table,ac:usize,ai:usize,b:&'a Table,bc:usize,
         Some(ColumnPairMut::Time(ac,bc)) => ac[ai]=bc[bi]
     }
 }
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct Table {
     columns:Vec<Column>,
     rows:usize
@@ -368,7 +389,7 @@ struct LifeTimeLessEdgeRef {
     source:NodeIndex,
     target:NodeIndex
 }
-fn removeLifetime(a:EdgeReference<Rc<Pairing>>)->LifeTimeLessEdgeRef {
+fn remove_lifetime(a:EdgeReference<Rc<Pairing>>)->LifeTimeLessEdgeRef {
     return LifeTimeLessEdgeRef {
         weight:a.weight().clone(),
         id:a.id(),
@@ -390,7 +411,7 @@ impl Iterator for BreadthFirstExpand {
                 None=>match self.queue.pop_front(){
                     None=>{return None;}
                     Some((nx,prev))=>{
-                        let a:Vec<_> = self.graph.edges(nx).map(|x|removeLifetime(x)).collect();
+                        let a:Vec<_> = self.graph.edges(nx).map(|x|remove_lifetime(x)).collect();
                         self.next=Some((a.into_iter(),prev));
                         continue;
                     }
@@ -413,12 +434,6 @@ impl Iterator for BreadthFirstExpand {
 
 
 
-
-
-
-
-
-
 #[derive(Clone,Copy)]
 enum RowMappingQuality {
     EqualFooting,
@@ -428,7 +443,54 @@ enum RowMappingQuality {
 struct RowMapping {
     ranges:Vec<Option<Vec<usize>>>
 }
-fn compare_columns<'a,T:Eq>(target:&'a [Option<T>],source:&'a [Option<T>])->Option<RowMapping> {
+fn extract_comparisons(tables:&Vec<Table>)->LinkGraph {
+    let mut deps = Graph::<usize,std::rc::Rc<Pairing>,Directed>::new();
+    for ind in 0..tables.len() {deps.add_node(ind);}
+    for ind1 in deps.node_indices() {
+        let tab1 = &tables[deps[ind1]];
+        for ind2 in deps.node_indices() {
+            if ind2>ind1 {continue;}
+            let tab2 = &tables[deps[ind2]];
+            for (icol1,col1) in tab1.columns.iter().enumerate() {
+                for (icol2,col2) in tab2.columns.iter().enumerate() {
+                    if icol1==icol2 && ind1==ind2 {continue;}
+                    if let Some((forward,backward)) = match columns_same_type(col1,col2) {
+                        Some(ColumnPair::Numeric(a,b))=>create_bi_pairing(a,b),
+                        Some(ColumnPair::String(a,b))=>create_bi_pairing(a,b),
+                        Some(ColumnPair::Time(a,b))=>create_bi_pairing(a,b),
+                        None=>None
+                    } {
+                        deps.add_edge(ind1,ind2,Rc::new(Pairing {
+                            source_col:icol1,dest_col:icol2,to:forward
+                        }));
+                        deps.add_edge(ind2,ind1,Rc::new(Pairing {
+                            source_col:icol2,dest_col:icol1,to:backward
+                        }));
+                    }
+                }
+            }
+        }
+    } deps
+}
+fn create_bi_pairing<'a,T:PartialEq>(target:&'a [Option<T>],source:&'a [Option<T>])->Option<(Vec<Vec<usize>>,Vec<Vec<usize>>)> {
+    let ab = create_pairing(target,source);
+    if ab.iter().all(|x|x.len()==0) {return None}
+    let ba = create_pairing(source,target);
+    return Some((ab,ba));
+}
+fn create_pairing<'a,T:PartialEq>(target:&'a [Option<T>],source:&'a [Option<T>])->Vec<Vec<usize>> {
+    let mut outp = Vec::new();
+    for t in target {
+        let mut rv = Vec::new();
+        if None!=*t {
+            for j in 0..source.len() {
+                if *t==source[j] { rv.push(j); }
+            }
+        }
+        outp.push(rv);
+    } outp
+}
+fn compare_columns<'a,T:PartialEq>(target:&'a [Option<T>],source:&'a [Option<T>])->Option<RowMapping> {
     let mut outp = Vec::new();
     for t in target {
         if let None=t {
@@ -443,8 +505,7 @@ fn compare_columns<'a,T:Eq>(target:&'a [Option<T>],source:&'a [Option<T>])->Opti
         }
         if rv.len()==0 {return None}
         outp.push(Some(rv));
-    }
-    return Some(RowMapping {
+    } Some(RowMapping {
         ranges:outp
     })
 }
@@ -483,15 +544,15 @@ fn concatenate_pairings(a:Pairing,b:Pairing)->Pairing {
         dest_col:b.dest_col
     }
 }
-fn compare_mappings<'a,T:Eq>(a:RowMapping,b:RowMapping)->Option<(RowMapping,RowMappingQuality)> {
+fn compare_mappings<'a,T:PartialEq>(a:RowMapping,b:RowMapping)->Option<(RowMapping,RowMappingQuality)> {
     let mut outp = Vec::new();
     let mut quality = RowMappingQuality::EqualFooting;
     if a.ranges.len()!=b.ranges.len() {panic!("Two mappings of different sizes should never arise.");}
     for lm in a.ranges.iter().zip(b.ranges.iter()) {
         outp.push(match (lm,quality) {
             ((None,None),_) => None,
-            ((Some(a),None),RowMappingQuality::LeftMoreEmpty) => return None,//Outer joins are not allowed in our DSL for good reason
-            ((None,Some(b)),RowMappingQuality::RightMoreEmpty) => return None,//Outer joins are not allowed in our DSL for good reason
+            ((Some(_),None),RowMappingQuality::LeftMoreEmpty) => return None,//Outer joins are not allowed in our DSL for good reason
+            ((None,Some(_)),RowMappingQuality::RightMoreEmpty) => return None,//Outer joins are not allowed in our DSL for good reason
             ((Some(a),None),_) => {
                 quality=RowMappingQuality::RightMoreEmpty;Some(a.clone())
             },
@@ -547,62 +608,130 @@ fn compare_mappings<'a,T:Eq>(a:RowMapping,b:RowMapping)->Option<(RowMapping,RowM
 
 
 
+#[derive(Debug, Serialize, Deserialize)]
+enum ColumnSchema {
+    String,
+    Numeric,
+    Time(String)
+}
+#[derive(Debug, Serialize, Deserialize)]
+struct TableSchema {
+    name:String,
+    columns:Vec<(String,ColumnSchema)>
+}
+#[derive(Debug, Serialize, Deserialize)]
+struct TestCaseSchema {
+    inputs:Vec<TableSchema>,
+    output:Vec<(String,ColumnSchema)>
+}
 
-fn run() -> Result<(), Box<dyn Error>> {
-    for file_path in env::args_os() {
-        let file = File::open(file_path)?;
-        let mut rdr = csv::Reader::from_reader(file);
-        for result in rdr.records() {
-            let record = result?;
-            println!("{:?}", record);
+#[derive(Debug)]
+struct Example {
+    inputs: Vec<Table>,
+    output: Table,
+    basepath: String
+}
+
+fn fit_examples(_schema:&TestCaseSchema,_examples: &Vec<Example>)->Tier1Table {
+    return Named(1).totop()
+}
+
+
+
+
+
+
+
+fn test_fit(schema:&TestCaseSchema,examples: &Vec<Example>,expr:&Tier1Table) {
+    for example in examples.iter() {
+        let comparison:Table = expr.evaluate(&example.inputs);
+        if !compare_table_values_full(&comparison,&example.output) {
+            let comparefile = format!("{}actual.csv",example.basepath);
+            write_file(comparefile.clone(),&schema.output,&comparison);
+            panic!("fit wasn't valid for example. Saved actual result to {}",comparefile);
         }
     }
-    Ok(())
 }
-
-/// Returns the first positional argument sent to this process. If there are no
-/// positional arguments, then this returns an error.
-fn get_first_arg() -> Result<OsString, Box<dyn Error>> {
-
-    match env::args_os().nth(1) {
-        None => Err(From::from("expected 1 argument, but got none")),
-        Some(file_path) => Ok(file_path),
+fn read_table(filepath:String,schema:&Vec<(String,ColumnSchema)>)->Table {
+    let file = File::open(filepath.clone()).expect(format!("File not found: {}",filepath).as_str());
+    let (cols,fmt) : (Vec<_>,Vec<_>) = schema.iter().map(|(_,u)|match u{
+        ColumnSchema::String=>(Column::String(vec![]),None),
+        ColumnSchema::Numeric=>(Column::Numeric(vec![]),None),
+        ColumnSchema::Time(fmt)=>(Column::Time(vec![]),Some(fmt))
+    }).unzip();
+    let mut tab = Table {columns: cols,rows:0};
+    for result in Reader::from_reader(file).records() {
+        tab.rows+=1;
+        for (ind,rec) in result.unwrap().iter().enumerate() {
+            let trimrec = rec.trim();
+            match &mut tab.columns[ind] {
+                Column::String(v)=>{
+                    v.push(if trimrec.len()==0 {None} else {Some(String::from(trimrec))})
+                }
+                Column::Numeric(v)=>{
+                    v.push(if trimrec.len()==0 {None} else {Some(f64::from_str(trimrec).expect("CSV column doesn't have proper numeric type"))})
+                }
+                Column::Time(v)=>{
+                    v.push(if trimrec.len()==0 {None} else {Some(NaiveDateTime::parse_from_str("23:56:04", fmt[ind].unwrap()).expect("CSV column doens't have proper time format"))})
+                }
+            }
+        }
+    } tab
+}
+fn write_file(filepath:String,schema:&Vec<(String,ColumnSchema)>,table:&Table) {
+    let mut wtr = Writer::from_path(filepath).expect("Could not write to output file");
+    for i in 0..table.rows {
+        let row:Vec<String> = table.columns.iter().map(|x|match x {
+            Column::Numeric(v)=>v[i].map(|y|format!("{}",y)).unwrap_or(String::from("")),
+            Column::String(v)=>v[i].clone().unwrap_or(String::from("")),
+            Column::Time(v)=>v[i].map(|y|format!("{}",y.format(match &schema[i].1 {
+                ColumnSchema::Time(fmt)=>&fmt,
+                _=>"%Y-%m-%d %H:%M:%S"
+            }))).unwrap_or(String::from(""))
+        }).collect();
+        wtr.write_record(&row).expect("Could not write record to file");
     }
+    wtr.flush().expect("Could not flush to output file");
 }
-
 fn main() {
-    println!("hello graph!");
-    let mut deps = Graph::<&str,&str,Directed>::new();
-    let pg = deps.add_node("petgraph");
-    let fb = deps.add_node("fixedbitset");
-    let qc = deps.add_node("quickcheck");
-    let rand = deps.add_node("rand");
-    let libc = deps.add_node("libc");
-    deps.extend_with_edges(&[
-        (pg, fb,"osidjf"),(fb,pg,"os2idjf"),(pg, fb,"osi3djf"), (pg, qc,"osidjf"),
-        (qc, rand,"osidjf"), (rand, libc,"osidjf"), (qc, libc,"osidjf"),
-    ]);
-
-    for ajaja in deps.edges(pg) {
-        let n1 = ajaja.source();
-        let n2 = ajaja.target();
-        println!("from {:?} to {:?} with edge {:?}",n1,n2,ajaja);
+    match env::args_os().nth(1) {
+        None => {
+            println!("please specify which test case should be attempted.");
+            println!("available test cases:");
+            for path in fs::read_dir("./testcases_v1/").unwrap() {
+                let unwr = path.unwrap();
+                if unwr.metadata().unwrap().file_type().is_dir() {
+                    println!("\t{}",unwr.path().components().last().unwrap().as_os_str().to_str().unwrap());
+                }
+            }
+        },
+        Some(file_path) => {
+            let patstr = file_path.to_str().unwrap();
+            match fs::read_dir(format!("./testcases_v1/{}",patstr)) {
+                Ok(iter)=>{
+                    let mut fileschema = File::open(format!("./testcases_v1/{}/schema.json",patstr)).unwrap();
+                    let mut dataschema = String::new();
+                    fileschema.read_to_string(&mut dataschema).unwrap();
+                    let schema:TestCaseSchema = serde_json::from_str(&dataschema).expect("JSON was not well-formatted");
+                    let examples:Vec<Example> = iter.filter_map(|x|{
+                        let y=x.unwrap();
+                        if !y.metadata().unwrap().file_type().is_dir() {return None}
+                        let ypath = y.path();
+                        let ycomp = ypath.components().last().unwrap().as_os_str().to_str().unwrap();
+                        return Some(Example {
+                            inputs: schema.inputs.iter().map(|sch|read_table(format!("./testcases_v1/{}/{}/input_tables/{}.csv",patstr,ycomp,sch.name),&sch.columns)).collect(),
+                            output: read_table(format!("./testcases_v1/{}/{}/output_table.csv",patstr,ycomp),&schema.output),
+                            basepath: format!("./testcases_v1/{}/{}/",patstr,ycomp)
+                        })
+                    }).collect();
+                    let fit = fit_examples(&schema,&examples);
+                    test_fit(&schema,&examples,&fit);
+                },
+                Err(_)=>{
+                    println!("cannot read testcase directory")
+                }
+            }
+        }
     }
-    
-
-    // graph.add_node("A");
-    // graph.add_node("B");
-    // graph.add_node("C");
-    // graph.add_node("D");
-    // graph.extend_with_edges(&[
-    //     (0, 1), (0, 2), (0, 3),
-    //     (1, 2), (1, 3),
-    //     (2, 3),
-    // ]);
-
-    // if let Err(err) = run() {
-    //     println!("{}", err);
-    //     process::exit(1);
-    // }
 }
 
