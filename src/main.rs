@@ -16,6 +16,7 @@ use serde::{Serialize,Deserialize};
 use std::vec::IntoIter;
 use std::io::Read;
 use csv::{Reader,Writer};
+use std::iter;
 
 use std::rc::{Rc};
 use std::cmp::Ordering;
@@ -377,19 +378,14 @@ fn add_null_row(a:&mut Table) {
 
 
 
-
-struct Pairing {
-    source_col:usize,
-    dest_col:usize,
-    to:Vec<Vec<usize>>
-}
+type Pairing = Vec<Vec<usize>>;
 struct LifeTimeLessEdgeRef {
-    weight:Rc<Pairing>,
+    weight:LinkGraphEdge,
     id:EdgeIndex,
     source:NodeIndex,
     target:NodeIndex
 }
-fn remove_lifetime(a:EdgeReference<Rc<Pairing>>)->LifeTimeLessEdgeRef {
+fn remove_lifetime(a:EdgeReference<LinkGraphEdge>)->LifeTimeLessEdgeRef {
     return LifeTimeLessEdgeRef {
         weight:a.weight().clone(),
         id:a.id(),
@@ -397,14 +393,60 @@ fn remove_lifetime(a:EdgeReference<Rc<Pairing>>)->LifeTimeLessEdgeRef {
         target:a.target()
     }
 }
-type LinkGraph = Graph<usize,Rc<Pairing>,Directed>;
-pub struct BreadthFirstExpand {
-    queue: VecDeque<(NodeIndex,Option<(EdgeIndex,usize)>)>,
-    graph: LinkGraph,
-    next: Option<(IntoIter<LifeTimeLessEdgeRef>,Option<(EdgeIndex,usize)>)>,
+#[derive(Clone)]
+struct PathAssociated {
+    // forward:Pairing,
+    backward:Pairing,
+    forward_match:RowMapping,
+    path:Vec<(usize,LinkGraphEdge)>,//target table, from column, to column
+    available_targets:Box<[Box<[bool]>]>
 }
-impl Iterator for BreadthFirstExpand {
-    type Item = ();
+impl PathAssociated {
+    fn concat_path_associated(&self,over:&LinkGraphEdge,totable:usize,targets: &[Vec<(RowMapping,usize,usize)>])->Option<Self> {
+        let (formatch,disabled) = translate_map_across_pair(&self.forward_match,&over.forward_pairing);
+        let mut avail2 = self.available_targets.clone();
+        if disabled.len()!=0 {
+            let mut encountered_sol = false;
+            for i in 0..targets.len() {
+                for j in 0..targets[i].len() {
+                    if avail2[i][j] {
+                        for disable in disabled.iter() {
+                            if !targets[i][j].0[*disable].1 {
+                                avail2[i][j]=false;
+                                break;
+                            }
+                        }
+                        if avail2[i][j] {encountered_sol = true;}
+                    }
+                }
+            }
+            if !encountered_sol {return None;}
+        }
+        Some(PathAssociated {
+            // forward:concatenate_pairings(&self.forward,&over.forward_pairing),
+            backward:concatenate_pairings(&over.backward_pairing,&self.backward),
+            forward_match:formatch,
+            path:self.path.iter().cloned().chain(iter::once((totable,over.clone()))).collect(),
+            available_targets:avail2
+        })
+    }
+}
+#[derive(Clone)]
+struct LinkGraphEdge {
+    source_col:usize,
+    dest_col:usize,
+    forward_pairing: Rc<Pairing>,
+    backward_pairing: Rc<Pairing>
+}
+type LinkGraph = Graph<usize,LinkGraphEdge,Directed>;
+struct BreadthFirstExpand<'a> {
+    queue: VecDeque<(NodeIndex,(Option<(EdgeIndex,usize)>,PathAssociated))>,
+    graph: LinkGraph,
+    next: Option<(IntoIter<LifeTimeLessEdgeRef>,(Option<(EdgeIndex,usize)>,PathAssociated))>,
+    targets: &'a Vec<Vec<(RowMapping,usize,usize)>>//table, column
+}
+impl<'a> Iterator for BreadthFirstExpand<'a> {
+    type Item = (PathAssociated,usize,usize);//target, column
     fn next(&mut self) -> Option<Self::Item>  {
         loop {
             match &mut self.next {
@@ -419,15 +461,27 @@ impl Iterator for BreadthFirstExpand {
                 Some((x,prev))=>match x.next() {
                     None => {self.next=None;continue;}
                     Some(y) => {
-                        if Some((y.id,y.weight.source_col)) == *prev {continue;}
-                        self.queue.push_back((y.target,Some((y.id,y.weight.dest_col))));
-                        return Some(());
+                        if Some((y.id,y.weight.source_col)) == prev.0 {continue;}
+                        if let Some(newassociatedpath) = prev.1.concat_path_associated(
+                            &y.weight,
+                            self.graph[y.target],
+                            self.targets
+                        ) {
+                            self.queue.push_back((y.target,(Some((y.id,y.weight.dest_col)),newassociatedpath.clone())));
+                            return Some((newassociatedpath,555,555));
+                        }
                     }
                 }
             }
         }
     }
 }
+
+// struct CartesianPathIterator<'a> {
+//     bfe:BreadthFirstExpand<'a>
+//     results:Vec<Vec<>>
+// }
+
 
 
 
@@ -440,11 +494,10 @@ enum RowMappingQuality {
     LeftMoreEmpty,
     RightMoreEmpty
 }
-struct RowMapping {
-    ranges:Vec<Option<Vec<usize>>>
-}
+type RowMapping = Vec<(Vec<usize>,bool)>;
+
 fn extract_comparisons(tables:&Vec<Table>)->LinkGraph {
-    let mut deps = Graph::<usize,std::rc::Rc<Pairing>,Directed>::new();
+    let mut deps = LinkGraph::new();
     for ind in 0..tables.len() {deps.add_node(ind);}
     for ind1 in deps.node_indices() {
         let tab1 = &tables[deps[ind1]];
@@ -460,12 +513,18 @@ fn extract_comparisons(tables:&Vec<Table>)->LinkGraph {
                         Some(ColumnPair::Time(a,b))=>create_bi_pairing(a,b),
                         None=>None
                     } {
-                        deps.add_edge(ind1,ind2,Rc::new(Pairing {
-                            source_col:icol1,dest_col:icol2,to:forward
-                        }));
-                        deps.add_edge(ind2,ind1,Rc::new(Pairing {
-                            source_col:icol2,dest_col:icol1,to:backward
-                        }));
+                        let forl = Rc::new(forward);
+                        let backl = Rc::new(backward);
+                        deps.add_edge(ind1,ind2,LinkGraphEdge {
+                            source_col:icol1,dest_col:icol2,
+                            forward_pairing:forl.clone(),
+                            backward_pairing:backl.clone()
+                        });
+                        deps.add_edge(ind2,ind1,LinkGraphEdge {
+                            source_col:icol2,dest_col:icol1,
+                            forward_pairing:backl,
+                            backward_pairing:forl
+                        });
                     }
                 }
             }
@@ -493,112 +552,94 @@ fn create_pairing<'a,T:PartialEq>(target:&'a [Option<T>],source:&'a [Option<T>])
 fn compare_columns<'a,T:PartialEq>(target:&'a [Option<T>],source:&'a [Option<T>])->Option<RowMapping> {
     let mut outp = Vec::new();
     for t in target {
-        if let None=t {
-            outp.push(None);
-            continue;
-        }
         let mut rv = Vec::new();
         for j in 0..source.len() {
             if *t==source[j] {
                 rv.push(j);
             }
         }
-        if rv.len()==0 {return None}
-        outp.push(Some(rv));
-    } Some(RowMapping {
-        ranges:outp
-    })
+        if rv.len()==0 && *t != None {return None}
+        outp.push((rv,*t==None));
+    } Some(outp)
 }
-fn translate_map_across_pair(map:RowMapping,pair:Pairing)->Option<RowMapping> {
+fn translate_map_across_pair(map:&RowMapping,pair:&Pairing)->(RowMapping,Vec<usize>) {
     let mut outp = Vec::new();
-    for range in map.ranges {
-        if let Some(r)=range {
-            let mut rv = Vec::new();
-            for val in r {
-                for p in pair.to[val].iter() {
-                    rv.push(*p);
-                }
+    let mut dropped = Vec::new();
+    for (ind,(r,s)) in map.iter().enumerate() {
+        let mut rv = Vec::new();
+        for val in r {
+            for p in pair[*val].iter() {
+                rv.push(*p);
             }
-            if rv.len()==0 {return None}
-            outp.push(Some(rv));
-        } else {
-            outp.push(None);
         }
+        if rv.len()==0 && !s {
+            dropped.push(ind);
+        } else {outp.push((rv,*s));}
     }
-    return Some(RowMapping {ranges:outp})
+    return (outp,dropped)
 }
-fn concatenate_pairings(a:Pairing,b:Pairing)->Pairing {
+fn concatenate_pairings(a:&Pairing,b:&Pairing)->Pairing {
     let mut res = Vec::new();
-    for ato in a.to {
+    for ato in a {
         let mut rv = Vec::new();
         for at in ato {
-            for bt in b.to[at].iter() {
+            for bt in b[*at].iter() {
                 rv.push(*bt);
             }
         }
         res.push(rv);
-    }
-    return Pairing {
-        to:res,
-        source_col:a.source_col,
-        dest_col:b.dest_col
-    }
+    } res
 }
-fn compare_mappings<'a,T:PartialEq>(a:RowMapping,b:RowMapping)->Option<(RowMapping,RowMappingQuality)> {
-    let mut outp = Vec::new();
-    let mut quality = RowMappingQuality::EqualFooting;
-    if a.ranges.len()!=b.ranges.len() {panic!("Two mappings of different sizes should never arise.");}
-    for lm in a.ranges.iter().zip(b.ranges.iter()) {
-        outp.push(match (lm,quality) {
-            ((None,None),_) => None,
-            ((Some(_),None),RowMappingQuality::LeftMoreEmpty) => return None,//Outer joins are not allowed in our DSL for good reason
-            ((None,Some(_)),RowMappingQuality::RightMoreEmpty) => return None,//Outer joins are not allowed in our DSL for good reason
-            ((Some(a),None),_) => {
-                quality=RowMappingQuality::RightMoreEmpty;Some(a.clone())
-            },
-            ((None,Some(b)),_) => {
-                quality=RowMappingQuality::LeftMoreEmpty;Some(b.clone())
-            },
-            ((Some(a),Some(b)),_) => {
-                let mut rv = Vec::new();
-                let mut i=0;let mut j=0;
-                while i<a.len() && j<b.len() {//each range in a rowmapping is sorted; this block calculates the intersection
-                    if a[i]==b[j] {
-                        rv.push(a[i]);
-                        i+=1;j+=1;
-                    } else if a[i]<b[i] {i+=1;} else {j+=1}
-                }
-                if rv.len()==0 {return None}
-                Some(rv)
-            },
-        });
-    }
-    return Some((RowMapping {ranges:outp},quality))
-}
-
-
-
-
-// struct PartialSolutionManager {
-//     Vec<Vec<>> solutions
+// fn compare_mappings(maps:&Vec<RowMapping>)->Option<(RowMapping,RowMappingQuality)> {
+//     let mut outp = Vec::new();
+//     let mut quality = RowMappingQuality::EqualFooting;
+//     // if a.len()!=b.len() {panic!("Two mappings of different sizes should never arise.");}
+//     for lm in a.iter().zip(b.iter()) {
+//         outp.push(match (lm,quality) {
+//             ((None,None),_) => None,
+//             ((Some(_),None),RowMappingQuality::LeftMoreEmpty) => return None,//Outer joins are not allowed in our DSL for good reason
+//             ((None,Some(_)),RowMappingQuality::RightMoreEmpty) => return None,//Outer joins are not allowed in our DSL for good reason
+//             ((Some(a),None),_) => {
+//                 quality=RowMappingQuality::RightMoreEmpty;Some(a.clone())
+//             },
+//             ((None,Some(b)),_) => {
+//                 quality=RowMappingQuality::LeftMoreEmpty;Some(b.clone())
+//             },
+//             ((Some(a),Some(b)),_) => {
+//                 let mut rv = Vec::new();
+//                 let mut i=0;let mut j=0;
+//                 while i<a.len() && j<b.len() {//each range in a rowmapping is sorted; this block calculates the intersection
+//                     if a[i]==b[j] {
+//                         rv.push(a[i]);
+//                         i+=1;j+=1;
+//                     } else if a[i]<b[i] {i+=1;} else {j+=1}
+//                 }
+//                 if rv.len()==0 {return None}
+//                 Some(rv)
+//             },
+//         });
+//     }
+//     return Some((RowMapping {ranges:outp},quality))
 // }
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+fn all_potential_mappings(inputs:&Vec<Table>,output:&Table)->Vec<Vec<(RowMapping,usize,usize)>> {
+    output.columns.iter().map(|col1|{
+        let mut options = Vec::new();
+        for (ind2,tab2) in inputs.iter().enumerate() {
+            for (icol2,col2) in tab2.columns.iter().enumerate() {
+                if let Some(rowmap) = match columns_same_type(col1,col2) {
+                    Some(ColumnPair::Numeric(a,b))=>compare_columns(a,b),
+                    Some(ColumnPair::String(a,b))=>compare_columns(a,b),
+                    Some(ColumnPair::Time(a,b))=>compare_columns(a,b),
+                    None=>None
+                } {
+                    options.push((rowmap,ind2,icol2))
+                }
+            }
+        } options
+    }).collect()
+}
 
 
 
@@ -632,7 +673,15 @@ struct Example {
     basepath: String
 }
 
-fn fit_examples(_schema:&TestCaseSchema,_examples: &Vec<Example>)->Tier1Table {
+
+
+
+
+
+fn fit_examples(_schema:&TestCaseSchema,examples: &Vec<Example>)->Tier1Table {
+    for example in examples {
+        let graph = extract_comparisons(&example.inputs);
+    }
     return Named(1).totop()
 }
 
